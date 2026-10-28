@@ -39,8 +39,10 @@ uint32_t PageChecksum(const std::byte* page) {
 // Grows a file from old_size to new_size bytes. fallocate reserves real
 // blocks so the file is not sparse (less fragmentation, and ENOSPC surfaces
 // here rather than at some later page write); filesystems without fallocate
-// support fall back to ftruncate.
+// support (and platforms without fallocate, e.g. macOS) fall back to
+// ftruncate.
 Status GrowFile(int fd, uint64_t old_size, uint64_t new_size) {
+#ifdef __linux__
   if (::fallocate(fd, 0, static_cast<off_t>(old_size),
                   static_cast<off_t>(new_size - old_size)) == 0) {
     return Status::Ok();
@@ -49,6 +51,9 @@ Status GrowFile(int fd, uint64_t old_size, uint64_t new_size) {
     return Status(StatusCode::kIoError,
                   "fallocate failed: " + std::string(std::strerror(errno)));
   }
+#else
+  (void)old_size;
+#endif
   if (::ftruncate(fd, static_cast<off_t>(new_size)) != 0) {
     return Status(StatusCode::kIoError,
                   "ftruncate failed: " + std::string(std::strerror(errno)));
