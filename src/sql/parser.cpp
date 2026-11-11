@@ -1,7 +1,9 @@
 #include "sql/parser.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <iterator>
 #include <limits>
 #include <utility>
 
@@ -193,8 +195,7 @@ class Parser {
   }
   bool AtEnd() const { return Peek().type == TokenType::kEnd; }
   bool IsKeyword(const Token& token, std::string_view keyword) const {
-    return token.type == TokenType::kIdentifier &&
-           Upper(token.text) == keyword;
+    return token.type == TokenType::kIdentifier && Upper(token.text) == keyword;
   }
   bool MatchKeyword(std::string_view keyword) {
     if (IsKeyword(Peek(), keyword)) {
@@ -260,7 +261,7 @@ class Parser {
   bool ParseCopy(Statement* statement);
   bool ParsePragma(Statement* statement);
   bool ParsePragmaArgument(Literal* literal);
-  bool ParseWhereClause(std::string* column, std::string* op, Literal* value,
+  bool ParseWhereClause(std::string* column, CompareOp* op, Literal* value,
                         bool* has_where);
   bool ParseShow(Statement* statement);
   bool ParseDescribe(Statement* statement);
@@ -325,8 +326,8 @@ bool Parser::ParseCreateTable(Statement* statement) {
       statement->if_not_exists = true;
     }
     return ExpectIdentifier(&statement->index_name) && ExpectKeyword("ON") &&
-        ExpectIdentifier(&statement->table_name) && ExpectSymbol("(") &&
-        ExpectIdentifier(&statement->index_column) && ExpectSymbol(")");
+           ExpectIdentifier(&statement->table_name) && ExpectSymbol("(") &&
+           ExpectIdentifier(&statement->index_column) && ExpectSymbol(")");
   }
   if (!ExpectKeyword("TABLE")) return Fail("expected TABLE or INDEX");
   statement->type = StatementType::kCreateTable;
@@ -651,10 +652,9 @@ bool Parser::ParseSelect(Statement* statement) {
   }
   if (!ExpectKeyword("FROM")) return false;
   if (!ExpectIdentifier(&statement->table_name)) return false;
-  if (!ParseWhereClause(&statement->select.where_column,
-                        &statement->select.where_op,
-                        &statement->select.where_value,
-                        &statement->select.has_where)) {
+  if (!ParseWhereClause(
+          &statement->select.where_column, &statement->select.where_op,
+          &statement->select.where_value, &statement->select.has_where)) {
     return false;
   }
   if (MatchKeyword("LIMIT")) {
@@ -671,10 +671,9 @@ bool Parser::ParseDelete(Statement* statement) {
   if (!ExpectKeyword("FROM")) return false;
   statement->type = StatementType::kDelete;
   if (!ExpectIdentifier(&statement->table_name)) return false;
-  return ParseWhereClause(&statement->delete_spec.where_column,
-                          &statement->delete_spec.where_op,
-                          &statement->delete_spec.where_value,
-                          &statement->delete_spec.has_where);
+  return ParseWhereClause(
+      &statement->delete_spec.where_column, &statement->delete_spec.where_op,
+      &statement->delete_spec.where_value, &statement->delete_spec.has_where);
 }
 
 bool Parser::ParseUpdate(Statement* statement) {
@@ -690,10 +689,9 @@ bool Parser::ParseUpdate(Statement* statement) {
     statement->update.assignments.push_back(std::move(assignment));
     if (!MatchSymbol(",")) break;
   }
-  return ParseWhereClause(&statement->update.where_column,
-                          &statement->update.where_op,
-                          &statement->update.where_value,
-                          &statement->update.has_where);
+  return ParseWhereClause(
+      &statement->update.where_column, &statement->update.where_op,
+      &statement->update.where_value, &statement->update.has_where);
 }
 
 bool Parser::ParseCopy(Statement* statement) {
@@ -701,7 +699,8 @@ bool Parser::ParseCopy(Statement* statement) {
   statement->type = StatementType::kCopy;
   if (!ExpectIdentifier(&statement->table_name)) return false;
   if (!ExpectKeyword("FROM")) return false;
-  if (Peek().type != TokenType::kString) return Fail("expected file path string");
+  if (Peek().type != TokenType::kString)
+    return Fail("expected file path string");
   statement->copy.path = Peek().text;
   ++pos_;
   if (MatchKeyword("DELIMITER")) {
@@ -745,18 +744,24 @@ bool Parser::ParsePragmaArgument(Literal* literal) {
   return ParseLiteral(literal);
 }
 
-bool Parser::ParseWhereClause(std::string* column, std::string* op,
+bool Parser::ParseWhereClause(std::string* column, CompareOp* op,
                               Literal* value, bool* has_where) {
   *has_where = false;
   if (!MatchKeyword("WHERE")) return true;
   *has_where = true;
   if (!ExpectIdentifier(column)) return false;
   if (Peek().type != TokenType::kSymbol) return Fail("expected comparison");
-  *op = Peek().text;
-  if (*op != "=" && *op != "<>" && *op != "!=" && *op != "<" && *op != "<=" &&
-      *op != ">" && *op != ">=") {
+  static const std::pair<const char*, CompareOp> kOperators[] = {
+      {"=", CompareOp::kEq}, {"<>", CompareOp::kNe}, {"!=", CompareOp::kNe},
+      {"<", CompareOp::kLt}, {"<=", CompareOp::kLe}, {">", CompareOp::kGt},
+      {">=", CompareOp::kGe}};
+  const auto* found = std::find_if(
+      std::begin(kOperators), std::end(kOperators),
+      [&](const auto& entry) { return Peek().text == entry.first; });
+  if (found == std::end(kOperators)) {
     return Fail("unsupported comparison operator");
   }
+  *op = found->second;
   ++pos_;
   return ParseLiteral(value);
 }

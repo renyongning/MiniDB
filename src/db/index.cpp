@@ -1,11 +1,10 @@
 // SQL index DDL, persistent discovery and tuple-to-index maintenance.
-#include "db/database.h"
-
 #include <filesystem>
 #include <iomanip>
 #include <sstream>
 
 #include "common/util.h"
+#include "db/database.h"
 
 namespace minidb {
 namespace {
@@ -35,13 +34,17 @@ Status Database::LoadIndexes() {
     auto tree = opened.TakeValue();
     const auto& m = tree->metadata();
     auto table = catalog_->GetTable(m.table);
-    if (!table.ok() || table.value()->table_id != m.table_id || table.value()->is_system ||
+    if (!table.ok() || table.value()->table_id != m.table_id ||
+        table.value()->is_system ||
         m.column >= table.value()->schema.num_columns())
-      return Status(StatusCode::kCorruption, "index has invalid table/column: " + m.name);
+      return Status(StatusCode::kCorruption,
+                    "index has invalid table/column: " + m.name);
     const auto& column = table.value()->schema.GetColumn(m.column);
     if (column.type != m.type || column.length != m.length ||
-        it->path().filename() != IndexFileName(m.name) || indexes_.count(m.name))
-      return Status(StatusCode::kCorruption, "index metadata mismatch: " + m.name);
+        it->path().filename() != IndexFileName(m.name) ||
+        indexes_.count(m.name))
+      return Status(StatusCode::kCorruption,
+                    "index metadata mismatch: " + m.name);
     indexes_.emplace(m.name, std::move(tree));
   }
   if (ec) return Status(StatusCode::kIoError, ec.message());
@@ -61,20 +64,27 @@ Status Database::ExecuteCreateIndex(Statement* statement, Transaction* txn,
   }
   // The hex file name must fit typical NAME_MAX (255 bytes).
   if (name.empty() || name.size() > 100)
-    return Status(StatusCode::kInvalidArgument, "index name must be 1..100 bytes");
+    return Status(StatusCode::kInvalidArgument,
+                  "index name must be 1..100 bytes");
   auto found = catalog_->GetTable(statement->table_name);
   if (!found.ok()) return found.status();
   TableInfo* table = found.value();
   if (table->is_system)
     return Status(StatusCode::kInvalidArgument, "cannot index a system table");
   const int ordinal = table->schema.IndexOf(statement->index_column);
-  if (ordinal < 0) return Status(StatusCode::kNotFound, "index column does not exist");
+  if (ordinal < 0)
+    return Status(StatusCode::kNotFound, "index column does not exist");
   const auto& column = table->schema.GetColumn(ordinal);
-  IndexMetadata m{name, table->name, table->table_id, static_cast<uint32_t>(ordinal),
-                  column.type, column.length};
+  IndexMetadata m{name,
+                  table->name,
+                  table->table_id,
+                  static_cast<uint32_t>(ordinal),
+                  column.type,
+                  column.length};
   auto s = BPlusTree::ValidateMetadata(m);
   if (!s.ok()) return s;
-  const fs::path path = fs::path(config_.path) / "indexes" / IndexFileName(name);
+  const fs::path path =
+      fs::path(config_.path) / "indexes" / IndexFileName(name);
   const std::string temporary = path.string() + ".building";
   std::error_code ec;
   // Only unfinished builds use this suffix; completed indexes are .idx files.
@@ -90,17 +100,24 @@ Status Database::ExecuteCreateIndex(Statement* statement, Transaction* txn,
     fs::remove(temporary, ignored);
     return failure;
   };
+  size_t sort_runs = 0, merge_passes = 0;
   {
+    BPlusTree::BulkLoader loader(*tree, config_.index_sort_memory);
     auto iterator = table->heap->Scan(txn);
     RID rid;
     Tuple tuple;
     while (iterator.Next(&rid, &tuple)) {
-      auto values = Tuple::Decode(table->schema, tuple.data().data(), tuple.size());
+      auto values =
+          Tuple::Decode(table->schema, tuple.data().data(), tuple.size());
       if (!values.ok()) return cleanup(values.status());
-      s = tree->Insert(values.value()[ordinal], rid);
+      s = loader.Add(values.value()[ordinal], rid);
       if (!s.ok()) return cleanup(s);
     }
     if (!iterator.status().ok()) return cleanup(iterator.status());
+    s = loader.Finish();
+    if (!s.ok()) return cleanup(s);
+    sort_runs = loader.runs();
+    merge_passes = loader.merge_passes() + 1;
   }
   const auto count = tree->size();
   s = pool_->FlushAll();
@@ -113,13 +130,21 @@ Status Database::ExecuteCreateIndex(Statement* statement, Transaction* txn,
   auto opened = BPlusTree::Open(*pool_, path.string());
   if (!opened.ok()) return opened.status();
   indexes_.emplace(name, opened.TakeValue());
-  result->message = "CREATE INDEX " + name + " (B+ tree, " + std::to_string(count) + " entries)";
+  result->message =
+      "CREATE INDEX " + name + " (B+ tree, " + std::to_string(count) +
+      " entries, " +
+      (sort_runs ? "external sort: " + std::to_string(sort_runs) +
+                       " runs merged in " + std::to_string(merge_passes) +
+                       (merge_passes == 1 ? " pass" : " passes")
+                 : std::string("sorted in memory")) +
+      ")";
   return Status::Ok();
 }
 
 Status Database::DropIndex(const std::string& name) {
   auto it = indexes_.find(name);
-  if (it == indexes_.end()) return Status(StatusCode::kNotFound, "index not found: " + name);
+  if (it == indexes_.end())
+    return Status(StatusCode::kNotFound, "index not found: " + name);
   auto s = pool_->DiscardFile(it->second->disk()->file_id());
   if (!s.ok()) return s;
   std::error_code ec;
@@ -151,90 +176,60 @@ Status Database::DropTableIndexes(const TableInfo& table) {
   return Status::Ok();
 }
 
+bool Database::HasIndexes(const TableInfo& table) const {
+  for (const auto& [name, tree] : indexes_)
+    if (tree->metadata().table_id == table.table_id) return true;
+  return false;
+}
+
 BPlusTree* Database::FindIndex(const TableInfo& table, size_t column) {
   for (auto& [name, tree] : indexes_)
-    if (tree->metadata().table_id == table.table_id && tree->metadata().column == column)
+    if (tree->metadata().table_id == table.table_id &&
+        tree->metadata().column == column)
       return tree.get();
   return nullptr;
 }
 
 Status Database::MaintainIndexes(const TableInfo& table, RID rid,
                                  const Tuple* before, const Tuple* after) {
-  bool indexed = false;
-  for (const auto& [name, tree] : indexes_)
-    if (tree->metadata().table_id == table.table_id) { indexed = true; break; }
-  if (!indexed) return Status::Ok();
+  if (!HasIndexes(table)) return Status::Ok();
   std::vector<Value> old_values, new_values;
   if (before) {
-    auto decoded = Tuple::Decode(table.schema, before->data().data(), before->size());
+    auto decoded =
+        Tuple::Decode(table.schema, before->data().data(), before->size());
     if (!decoded.ok()) return decoded.status();
     old_values = decoded.TakeValue();
   }
   if (after) {
-    auto decoded = Tuple::Decode(table.schema, after->data().data(), after->size());
+    auto decoded =
+        Tuple::Decode(table.schema, after->data().data(), after->size());
     if (!decoded.ok()) return decoded.status();
     new_values = decoded.TakeValue();
   }
   for (auto& [name, tree] : indexes_) {
     const auto& m = tree->metadata();
     if (m.table_id != table.table_id) continue;
-    if (before && after && old_values[m.column].IsNull() == new_values[m.column].IsNull() &&
-        CompareValues(old_values[m.column], new_values[m.column]) == 0) continue;
+    if (before && after &&
+        old_values[m.column].IsNull() == new_values[m.column].IsNull() &&
+        CompareValues(old_values[m.column], new_values[m.column]) == 0)
+      continue;
     Status s;
     if (before) s = tree->Erase(old_values[m.column], rid);
     if (s.ok() && after) s = tree->Insert(new_values[m.column], rid);
     if (!s.ok()) {
       // Heap writes have already succeeded (the existing engine has no undo).
-      // Remove derived indexes so subsequent queries use authoritative heap data.
+      // Remove derived indexes so subsequent queries use authoritative heap
+      // data.
       const auto cause = s.message();
       const auto dropped = DropTableIndexes(table);
-      return Status(s.code(), "index maintenance failed: " + cause +
-          (dropped.ok() ? "; table indexes removed, rebuild with CREATE INDEX"
-                        : "; index cleanup failed: " + dropped.message()));
+      return Status(
+          s.code(),
+          "index maintenance failed: " + cause +
+              (dropped.ok()
+                   ? "; table indexes removed, rebuild with CREATE INDEX"
+                   : "; index cleanup failed: " + dropped.message()));
     }
   }
-  return Status::Ok();
-}
-
-Status Database::ExecuteIndexPragma(Statement* statement, QueryResult* result) {
-  const auto& spec = statement->pragma;
-  const auto name = ToLower(spec.name);
-  if (name == "indexes") {
-    if (spec.has_value || spec.args.size() > 1)
-      return Status(StatusCode::kInvalidArgument, "usage: PRAGMA indexes[(table)]");
-    result->columns = {{"index", TypeId::kVarchar}, {"table", TypeId::kVarchar},
-        {"column", TypeId::kVarchar}, {"type", TypeId::kVarchar}, {"entries", TypeId::kInt64}};
-    for (const auto& [index_name, tree] : indexes_) {
-      const auto& m = tree->metadata();
-      if (!spec.args.empty() && ToLower(spec.args[0].text) != m.table) continue;
-      auto table = catalog_->GetTable(m.table);
-      if (!table.ok()) return table.status();
-      result->rows.push_back({Value::String(index_name), Value::String(m.table),
-          Value::String(table.value()->schema.GetColumn(m.column).name),
-          Value::String(table.value()->schema.TypeName(m.column)), Value::Int64(tree->size())});
-    }
-    return Status::Ok();
-  }
-  if (spec.has_value || spec.args.size() != 1)
-    return Status(StatusCode::kInvalidArgument, "usage: PRAGMA " + name + "(index)");
-  const auto found = indexes_.find(ToLower(spec.args[0].text));
-  if (found == indexes_.end()) return Status(StatusCode::kNotFound, "index not found");
-  if (name == "index_dot" || name == "index_tree") {
-    auto drawing = name == "index_dot" ? found->second->Dot() : found->second->Draw();
-    if (!drawing.ok()) return drawing.status();
-    result->columns = {{name, TypeId::kVarchar}};
-    result->rows = {{Value::String(drawing.TakeValue())}};
-    return Status::Ok();
-  }
-  auto stats = found->second->Validate();
-  if (!stats.ok()) return stats.status();
-  const auto& s = stats.value();
-  result->columns = {{"valid", TypeId::kVarchar}, {"entries", TypeId::kInt64},
-      {"height", TypeId::kInt32}, {"nodes", TypeId::kInt32}, {"leaves", TypeId::kInt32},
-      {"free_pages", TypeId::kInt32}, {"capacity", TypeId::kInt32}, {"root", TypeId::kInt64}};
-  result->rows = {{Value::String("ok"), Value::Int64(s.entries), Value::Int32(s.height),
-      Value::Int32(s.nodes), Value::Int32(s.leaves), Value::Int32(s.free_pages),
-      Value::Int32(s.capacity), Value::Int64(s.root)}};
   return Status::Ok();
 }
 }  // namespace minidb

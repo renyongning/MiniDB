@@ -79,6 +79,8 @@ struct PragmaContext {
   const PragmaSpec& spec;
   Catalog& catalog;
   BufferPool& pool;
+  const std::map<std::string, std::unique_ptr<BPlusTree>>& indexes;
+  size_t& index_sort_memory;
   Transaction* txn;
   QueryResult* result;
 
@@ -92,6 +94,14 @@ struct PragmaContext {
   Result<TableInfo*> TableArg(size_t index) const {
     return catalog.GetTable(spec.args[index].text);
   }
+  Result<BPlusTree*> IndexArg(size_t index) const {
+    const auto found = indexes.find(ToLower(spec.args[index].text));
+    if (found == indexes.end()) {
+      return Status(StatusCode::kNotFound,
+                    "index not found: " + spec.args[index].text);
+    }
+    return found->second.get();
+  }
   Result<page_id_t> PageArg(size_t index) const {
     const Literal& literal = spec.args[index];
     if (literal.kind != Literal::Kind::kInteger || literal.integer < 0 ||
@@ -104,9 +114,9 @@ struct PragmaContext {
 
 // Per-page counts gathered from the slot directories of a table's heap pages.
 struct HeapPageSummary {
-  int64_t records = 0;    // user-visible rows stored on the page
-  int64_t forwards = 0;   // FORWARD slots (rows living elsewhere)
-  int64_t moved_in = 0;   // MOVED_IN copies of rows from other pages
+  int64_t records = 0;   // user-visible rows stored on the page
+  int64_t forwards = 0;  // FORWARD slots (rows living elsewhere)
+  int64_t moved_in = 0;  // MOVED_IN copies of rows from other pages
   int64_t empty_slots = 0;
   uint32_t free_bytes = 0;
 };
@@ -131,8 +141,9 @@ HeapPageSummary SummarizeHeapPage(const std::byte* page) {
 }
 
 // Calls fn(page_id, page bytes) for every allocated heap page of a table.
-Status ForEachHeapPage(BufferPool& pool, TableInfo* table,
-                       const std::function<Status(page_id_t, const std::byte*)>& fn) {
+Status ForEachHeapPage(
+    BufferPool& pool, TableInfo* table,
+    const std::function<Status(page_id_t, const std::byte*)>& fn) {
   for (page_id_t page_id : table->segment->AllocatedPages()) {
     auto guard = pool.FetchRead(table->data_disk, page_id);
     if (!guard.ok()) return guard.status();
@@ -170,8 +181,9 @@ Status BufferStatsPragma(PragmaContext& ctx) {
   ctx.result->rows.push_back(
       {Int(static_cast<int64_t>(ctx.pool.FrameCount())),
        Int(static_cast<int64_t>(frames.size())), Int(pinned), Int(dirty),
-       Int(static_cast<int64_t>(stats.hit)), Int(static_cast<int64_t>(stats.miss)),
-       Percent(stats.HitRate()), Int(static_cast<int64_t>(stats.evict)),
+       Int(static_cast<int64_t>(stats.hit)),
+       Int(static_cast<int64_t>(stats.miss)), Percent(stats.HitRate()),
+       Int(static_cast<int64_t>(stats.evict)),
        Int(static_cast<int64_t>(stats.flush)),
        Int(static_cast<int64_t>(stats.new_page))});
   return Status::Ok();
@@ -189,8 +201,9 @@ Status BufferFramesPragma(PragmaContext& ctx) {
   for (const FrameInfo& frame : ctx.pool.Frames()) {
     ctx.result->rows.push_back(
         {Int(frame.frame), Text(frame.file), Int(frame.page_id),
-         frame.page_type == PageType::kInvalid ? Value::Null()
-                                               : Text(PageTypeName(frame.page_type)),
+         frame.page_type == PageType::kInvalid
+             ? Value::Null()
+             : Text(PageTypeName(frame.page_type)),
          Int(frame.pin_count), Int(frame.dirty ? 1 : 0)});
   }
   return Status::Ok();
@@ -206,24 +219,25 @@ Status TableInfoPragma(PragmaContext& ctx) {
 
   int64_t heap_pages = 0;
   HeapPageSummary total;
-  status = ForEachHeapPage(ctx.pool, info, [&](page_id_t, const std::byte* page) {
-    const HeapPageSummary summary = SummarizeHeapPage(page);
-    ++heap_pages;
-    total.records += summary.records;
-    total.forwards += summary.forwards;
-    total.moved_in += summary.moved_in;
-    total.empty_slots += summary.empty_slots;
-    total.free_bytes += summary.free_bytes;
-    return Status::Ok();
-  });
+  status =
+      ForEachHeapPage(ctx.pool, info, [&](page_id_t, const std::byte* page) {
+        const HeapPageSummary summary = SummarizeHeapPage(page);
+        ++heap_pages;
+        total.records += summary.records;
+        total.forwards += summary.forwards;
+        total.moved_in += summary.moved_in;
+        total.empty_slots += summary.empty_slots;
+        total.free_bytes += summary.free_bytes;
+        return Status::Ok();
+      });
   if (!status.ok()) return status;
 
   const auto file_bytes = [](const DiskManager& disk) {
     return static_cast<int64_t>(disk.header().file_extents) * kPagesPerExtent *
            kPageSize;
   };
-  const double capacity =
-      static_cast<double>(heap_pages) * (kPageSize - HeapPage::kSlotArrayOffset);
+  const double capacity = static_cast<double>(heap_pages) *
+                          (kPageSize - HeapPage::kSlotArrayOffset);
   SetColumns(ctx.result, {{"table", TypeId::kVarchar},
                           {"data_file", TypeId::kVarchar},
                           {"data_bytes", TypeId::kInt64},
@@ -241,13 +255,16 @@ Status TableInfoPragma(PragmaContext& ctx) {
                           {"fill_pct", TypeId::kDouble},
                           {"fsm_pages", TypeId::kInt64}});
   ctx.result->rows.push_back(
-      {Text(info->name), Text(info->data_file), Int(file_bytes(*info->data_disk)),
-       Text(info->fsm_file), Int(file_bytes(*info->fsm_disk)),
-       Int(segment.header_page()), Int(static_cast<int64_t>(segment.extent_count())),
-       Int(static_cast<int64_t>(segment.extent_slots())), Int(segment.page_count()),
-       Int(heap_pages), Int(total.records + total.forwards), Int(total.forwards),
+      {Text(info->name), Text(info->data_file),
+       Int(file_bytes(*info->data_disk)), Text(info->fsm_file),
+       Int(file_bytes(*info->fsm_disk)), Int(segment.header_page()),
+       Int(static_cast<int64_t>(segment.extent_count())),
+       Int(static_cast<int64_t>(segment.extent_slots())),
+       Int(segment.page_count()), Int(heap_pages),
+       Int(total.records + total.forwards), Int(total.forwards),
        Int(total.empty_slots), Int(total.free_bytes),
-       Percent(capacity > 0 ? 100.0 * (1.0 - total.free_bytes / capacity) : 0.0),
+       Percent(capacity > 0 ? 100.0 * (1.0 - total.free_bytes / capacity)
+                            : 0.0),
        Int(info->fsm->page_count())});
   return Status::Ok();
 }
@@ -267,8 +284,9 @@ Status ExtentsPragma(PragmaContext& ctx) {
   for (size_t slot = 0; slot < extents.size(); ++slot) {
     const ExtentEntry& entry = extents[slot];
     if (!entry.valid()) {  // hole left by a freed extent (design doc 5.5)
-      ctx.result->rows.push_back({Int(static_cast<int64_t>(slot)), Value::Null(),
-                                  Value::Null(), Int(0), Text("(hole)")});
+      ctx.result->rows.push_back({Int(static_cast<int64_t>(slot)),
+                                  Value::Null(), Value::Null(), Int(0),
+                                  Text("(hole)")});
       continue;
     }
     const page_id_t first = entry.extent_id * kPagesPerExtent;
@@ -330,11 +348,11 @@ Status FreeSpacePragma(PragmaContext& ctx) {
   // Collect the page contents first: reading an FSM page while holding a heap
   // page latch would break the latch order of design doc 11.5.
   std::vector<std::pair<page_id_t, HeapPageSummary>> pages;
-  Status status = ForEachHeapPage(ctx.pool, info, [&](page_id_t page_id,
-                                                      const std::byte* page) {
-    pages.emplace_back(page_id, SummarizeHeapPage(page));
-    return Status::Ok();
-  });
+  Status status = ForEachHeapPage(
+      ctx.pool, info, [&](page_id_t page_id, const std::byte* page) {
+        pages.emplace_back(page_id, SummarizeHeapPage(page));
+        return Status::Ok();
+      });
   if (!status.ok()) return status;
   for (const auto& [page_id, summary] : pages) {
     auto spno = info->segment->SpnoOfPage(page_id);
@@ -393,7 +411,8 @@ Status PageHeaderPragma(PragmaContext& ctx) {
     if (!guard.ok()) return guard.status();
     const std::byte* page = guard.value().Data();
     const PageType type = GetPageType(page);
-    row = {Int(page_id.value()), Text(PageTypeName(type)), Int(GetSegmentId(page)),
+    row = {Int(page_id.value()), Text(PageTypeName(type)),
+           Int(GetSegmentId(page)),
            Int(static_cast<int64_t>(ReadU64(page, kPageLsnOffset)))};
     if (type == PageType::kHeap) {
       row.push_back(Int(HeapPage::SlotCount(page)));
@@ -437,7 +456,8 @@ Status PageSlotsPragma(PragmaContext& ctx) {
   if (GetPageType(page) != PageType::kHeap) {
     return Status(StatusCode::kInvalidArgument,
                   "page " + std::to_string(page_id.value()) + " is a " +
-                      PageTypeName(GetPageType(page)) + " page, not a heap page");
+                      PageTypeName(GetPageType(page)) +
+                      " page, not a heap page");
   }
   SetColumns(ctx.result, {{"slot", TypeId::kInt64},
                           {"offset", TypeId::kInt64},
@@ -452,10 +472,10 @@ Status PageSlotsPragma(PragmaContext& ctx) {
       auto rid = HeapPage::ReadForwardTarget(page, slot);
       if (rid.ok()) target = Text(FormatRid(rid.value()));
     }
-    ctx.result->rows.push_back(
-        {Int(slot), s.empty() ? Value::Null() : Int(s.offset),
-         s.empty() ? Value::Null() : Int(s.length), Text(SlotFlagsName(s)),
-         std::move(target)});
+    ctx.result->rows.push_back({Int(slot),
+                                s.empty() ? Value::Null() : Int(s.offset),
+                                s.empty() ? Value::Null() : Int(s.length),
+                                Text(SlotFlagsName(s)), std::move(target)});
   }
   return Status::Ok();
 }
@@ -501,6 +521,95 @@ struct PragmaEntry {
   Status (*run)(PragmaContext&);
 };
 
+// Kilobytes CREATE INDEX may sort in before it spills sorted runs to disk.
+Status IndexSortMemoryPragma(PragmaContext& ctx) {
+  if (!ctx.spec.args.empty()) {
+    return Status(StatusCode::kInvalidArgument,
+                  "usage: PRAGMA index_sort_memory [= kilobytes]");
+  }
+  if (ctx.spec.has_value) {
+    const Literal& value = ctx.spec.value;
+    if (value.kind != Literal::Kind::kInteger || value.integer < 1 ||
+        value.integer > (int64_t{1} << 30)) {
+      return Status(StatusCode::kInvalidArgument,
+                    "index_sort_memory must be a positive number of KB");
+    }
+    ctx.index_sort_memory = static_cast<size_t>(value.integer) * 1024;
+  }
+  SetColumns(ctx.result, {{"index_sort_memory_kb", TypeId::kInt64}});
+  ctx.result->rows.push_back(
+      {Int(static_cast<int64_t>(ctx.index_sort_memory / 1024))});
+  return Status::Ok();
+}
+
+Status IndexesPragma(PragmaContext& ctx) {
+  if (ctx.spec.has_value || ctx.spec.args.size() > 1) {
+    return Status(StatusCode::kInvalidArgument,
+                  "usage: PRAGMA indexes[(table)]");
+  }
+  SetColumns(ctx.result, {{"index", TypeId::kVarchar},
+                          {"table", TypeId::kVarchar},
+                          {"column", TypeId::kVarchar},
+                          {"type", TypeId::kVarchar},
+                          {"entries", TypeId::kInt64}});
+  for (const auto& [name, tree] : ctx.indexes) {
+    const IndexMetadata& m = tree->metadata();
+    if (!ctx.spec.args.empty() && ToLower(ctx.spec.args[0].text) != m.table) {
+      continue;
+    }
+    auto table = ctx.catalog.GetTable(m.table);
+    if (!table.ok()) return table.status();
+    const Schema& schema = table.value()->schema;
+    ctx.result->rows.push_back({Text(name), Text(m.table),
+                                Text(schema.GetColumn(m.column).name),
+                                Text(schema.TypeName(m.column)),
+                                Int(static_cast<int64_t>(tree->size()))});
+  }
+  return Status::Ok();
+}
+
+// Walks the whole tree checking every invariant, then reports its shape.
+Status IndexCheckPragma(PragmaContext& ctx) {
+  const Status args = ctx.ArgCount(1, "index_check(index)");
+  if (!args.ok()) return args;
+  auto tree = ctx.IndexArg(0);
+  if (!tree.ok()) return tree.status();
+  auto stats = tree.value()->Validate();
+  if (!stats.ok()) return stats.status();
+  const IndexStats& s = stats.value();
+  SetColumns(ctx.result, {{"valid", TypeId::kVarchar},
+                          {"entries", TypeId::kInt64},
+                          {"height", TypeId::kInt32},
+                          {"nodes", TypeId::kInt32},
+                          {"leaves", TypeId::kInt32},
+                          {"free_pages", TypeId::kInt32},
+                          {"capacity", TypeId::kInt32},
+                          {"root", TypeId::kInt64}});
+  ctx.result->rows.push_back(
+      {Text("ok"), Int(static_cast<int64_t>(s.entries)), Value::Int32(s.height),
+       Value::Int32(s.nodes), Value::Int32(s.leaves),
+       Value::Int32(s.free_pages), Value::Int32(s.capacity), Int(s.root)});
+  return Status::Ok();
+}
+
+Status IndexDrawing(PragmaContext& ctx, const char* name, bool dot) {
+  const Status args = ctx.ArgCount(1, (std::string(name) + "(index)").c_str());
+  if (!args.ok()) return args;
+  auto tree = ctx.IndexArg(0);
+  if (!tree.ok()) return tree.status();
+  auto drawing = dot ? tree.value()->Dot() : tree.value()->Draw();
+  if (!drawing.ok()) return drawing.status();
+  SetColumns(ctx.result, {{name, TypeId::kVarchar}});
+  ctx.result->rows.push_back({Text(drawing.TakeValue())});
+  return Status::Ok();
+}
+Status IndexTreePragma(PragmaContext& ctx) {
+  return IndexDrawing(ctx, "index_tree", false);
+}
+Status IndexDotPragma(PragmaContext& ctx) {
+  return IndexDrawing(ctx, "index_dot", true);
+}
+
 constexpr PragmaEntry kPragmas[] = {
     {"pragma_list", "", "this list", &PragmaList},
     {"buffer_stats", "", "buffer pool counters and hit rate",
@@ -521,6 +630,16 @@ constexpr PragmaEntry kPragmas[] = {
      &PageHeaderPragma},
     {"page_slots", "table, page_id", "slot directory of a heap page",
      &PageSlotsPragma},
+    {"indexes", "[table]", "B+ tree indexes: table, column, type, entries",
+     &IndexesPragma},
+    {"index_check", "index", "verify all tree invariants and report its shape",
+     &IndexCheckPragma},
+    {"index_stats", "index", "same as index_check", &IndexCheckPragma},
+    {"index_tree", "index", "draw the tree as indented text", &IndexTreePragma},
+    {"index_dot", "index", "the tree as Graphviz DOT source", &IndexDotPragma},
+    {"index_sort_memory", "[= kilobytes]",
+     "memory CREATE INDEX sorts in before spilling runs to disk",
+     &IndexSortMemoryPragma},
     {"flush", "", "write all dirty pages and fsync", &FlushPragma},
     {"log_level", "[= level]", "show or set debug|info|warn|error|off",
      &LogLevelPragma},
@@ -532,9 +651,6 @@ Status PragmaList(PragmaContext& ctx) {
   SetColumns(ctx.result, {{"name", TypeId::kVarchar},
                           {"arguments", TypeId::kVarchar},
                           {"description", TypeId::kVarchar}});
-  for (const auto* name : {"indexes", "index_stats", "index_check", "index_tree", "index_dot"})
-    ctx.result->rows.push_back({Text(name), Text(name == std::string("indexes") ? "[table]" : "index"),
-                                Text("B+ tree index introspection")});
   for (const PragmaEntry& entry : kPragmas) {
     ctx.result->rows.push_back(
         {Text(entry.name), Text(entry.arguments), Text(entry.description)});
@@ -546,11 +662,9 @@ Status PragmaList(PragmaContext& ctx) {
 
 Status Database::ExecutePragma(Statement* statement, Transaction* txn,
                                QueryResult* result) {
-  PragmaContext ctx{statement->pragma, *catalog_, *pool_, txn, result};
+  PragmaContext ctx{statement->pragma,         *catalog_, *pool_, indexes_,
+                    config_.index_sort_memory, txn,       result};
   const std::string name = ToLower(statement->pragma.name);
-  if (name == "indexes" || name == "index_stats" || name == "index_check" ||
-      name == "index_tree" || name == "index_dot")
-    return ExecuteIndexPragma(statement, result);
   for (const PragmaEntry& entry : kPragmas) {
     if (name == entry.name) return entry.run(ctx);
   }

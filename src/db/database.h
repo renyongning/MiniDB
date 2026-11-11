@@ -2,15 +2,16 @@
 // (design doc 3.4, 18).
 #pragma once
 
-#include <memory>
+#include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "catalog/catalog.h"
 #include "common/status.h"
-#include "log/log_manager.h"
 #include "index/bplus_tree.h"
+#include "log/log_manager.h"
 #include "record/value.h"
 #include "sql/parser.h"
 #include "txn/txn_manager.h"
@@ -24,6 +25,8 @@ struct Config {
   std::string replacer = "clock";
   std::string log_level = "info";
   std::string log_file;
+  // Memory CREATE INDEX may sort in before spilling sorted runs to disk.
+  size_t index_sort_memory = BPlusTree::kDefaultSortMemory;
 };
 
 struct QueryColumn {
@@ -36,6 +39,13 @@ struct QueryResult {
   std::vector<std::vector<Value>> rows;
   int changes = 0;
   std::string message;
+};
+
+// The single `column op value` condition a statement's WHERE clause allows.
+struct RowFilter {
+  int column = -1;  // schema ordinal; -1 when there is no WHERE
+  CompareOp op = CompareOp::kEq;
+  Value value;
 };
 
 class Database {
@@ -83,12 +93,20 @@ class Database {
   Status LoadIndexes();
   Status ExecuteCreateIndex(Statement*, Transaction*, QueryResult*);
   Status ExecuteDropIndex(Statement*, QueryResult*);
-  Status ExecuteIndexPragma(Statement*, QueryResult*);
   Status DropIndex(const std::string& name);
   Status DropTableIndexes(const TableInfo& table);
   BPlusTree* FindIndex(const TableInfo& table, size_t column);
-  Status MaintainIndexes(const TableInfo& table, RID rid,
-                         const Tuple* before, const Tuple* after);
+  bool HasIndexes(const TableInfo& table) const;
+  // Visits the rows of `table` that satisfy `filter` until the visitor
+  // returns false: through an index on the filtered column when one helps,
+  // otherwise by scanning the heap. Returns the index used, or null. The
+  // visitor must not modify the table.
+  using RowVisitor =
+      std::function<bool(RID, const Tuple&, const std::vector<Value>&)>;
+  Result<BPlusTree*> FindRows(const TableInfo& table, Transaction* txn,
+                              const RowFilter& filter, const RowVisitor& visit);
+  Status MaintainIndexes(const TableInfo& table, RID rid, const Tuple* before,
+                         const Tuple* after);
 
   Config config_;
   // Declaration order is construction order; destruction runs in reverse, so

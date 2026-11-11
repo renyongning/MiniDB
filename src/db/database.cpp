@@ -115,22 +115,36 @@ Result<Value> LiteralToValue(const Literal& literal, const Column& column) {
   return Status(StatusCode::kTypeMismatch, "unsupported column type");
 }
 
-bool Matches(const Value& value, const std::string& op, const Value& literal) {
-  if (value.IsNull() || literal.IsNull()) return false;
-  const int cmp = CompareValues(value, literal);
-  if (op == "=") return cmp == 0;
-  if (op == "<>" || op == "!=") return cmp != 0;
-  if (op == "<") return cmp < 0;
-  if (op == "<=") return cmp <= 0;
-  if (op == ">") return cmp > 0;
-  if (op == ">=") return cmp >= 0;
-  return false;
+// Binds the optional `WHERE column op literal` of a statement to a table.
+template <class Spec>
+Result<RowFilter> BindWhere(const Schema& schema, const Spec& spec) {
+  RowFilter filter;
+  if (!spec.has_where) return filter;
+  filter.column = schema.IndexOf(spec.where_column);
+  if (filter.column < 0) {
+    return Status(StatusCode::kNotFound,
+                  "column " + spec.where_column + " does not exist");
+  }
+  auto converted =
+      LiteralToValue(spec.where_value, schema.GetColumn(filter.column));
+  if (!converted.ok()) return converted.status();
+  filter.op = spec.where_op;
+  filter.value = converted.TakeValue();
+  if (filter.value.IsNull()) {
+    return Status(StatusCode::kInvalidArgument, "WHERE NULL is not supported");
+  }
+  return filter;
 }
 
 void AppendMessage(QueryResult* result, const std::string& message) {
   if (message.empty()) return;
   if (!result->message.empty()) result->message.push_back('\n');
   result->message += message;
+}
+
+// Says in the statement's message that rows were located through an index.
+void NoteIndexScan(QueryResult* result, const BPlusTree* index) {
+  if (index) AppendMessage(result, "INDEX SCAN " + index->metadata().name);
 }
 
 }  // namespace
@@ -155,9 +169,9 @@ Result<std::unique_ptr<Database>> Database::Open(const Config& config) {
   } else {
     fs::create_directories(directory, ec);
     if (ec) {
-      return Status(StatusCode::kIoError,
-                    "cannot create database folder " + config.path + ": " +
-                        ec.message());
+      return Status(
+          StatusCode::kIoError,
+          "cannot create database folder " + config.path + ": " + ec.message());
     }
   }
 
@@ -169,9 +183,9 @@ Result<std::unique_ptr<Database>> Database::Open(const Config& config) {
   const bool has_tables = fs::exists(sys_tables_data);
   const bool has_columns = fs::exists(sys_columns_data);
   if (has_tables != has_columns) {
-    return Status(StatusCode::kCorruption,
-                  "database folder has an incomplete system catalog: " +
-                      config.path);
+    return Status(
+        StatusCode::kCorruption,
+        "database folder has an incomplete system catalog: " + config.path);
   }
   const bool create_new = !has_tables;
   if (create_new) {
@@ -181,9 +195,9 @@ Result<std::unique_ptr<Database>> Database::Open(const Config& config) {
                         config.path);
     }
   } else if (!fs::exists(sys_tables_fsm) || !fs::exists(sys_columns_fsm)) {
-    return Status(StatusCode::kCorruption,
-                  "database folder is missing a system FSM file: " +
-                      config.path);
+    return Status(
+        StatusCode::kCorruption,
+        "database folder is missing a system FSM file: " + config.path);
   }
 
   auto database = std::unique_ptr<Database>(new Database(config));
@@ -196,8 +210,8 @@ Result<std::unique_ptr<Database>> Database::Open(const Config& config) {
   database->txns_ = std::make_unique<TxnManager>();
 
   if (create_new) {
-    auto catalog = Catalog::Bootstrap(config.path, *database->pool_,
-                                      *database->log_);
+    auto catalog =
+        Catalog::Bootstrap(config.path, *database->pool_, *database->log_);
     if (!catalog.ok()) return catalog.status();
     database->catalog_ = catalog.TakeValue();
     MINIDB_LOG_INFO("DB") << "created new database folder " << config.path;
@@ -384,9 +398,9 @@ Status Database::ExecuteInsert(Statement* statement, Transaction* txn,
     for (const std::string& name : statement->insert.columns) {
       const int index = schema.IndexOf(name);
       if (index < 0) {
-        return Status(StatusCode::kNotFound,
-                      "column " + name + " does not exist in table " +
-                          table->name);
+        return Status(
+            StatusCode::kNotFound,
+            "column " + name + " does not exist in table " + table->name);
       }
       for (int existing : mapping) {
         if (existing == index) {
@@ -411,8 +425,9 @@ Status Database::ExecuteInsert(Statement* statement, Transaction* txn,
       const Column& column = schema.GetColumn(static_cast<size_t>(mapping[i]));
       auto value = LiteralToValue(row[i], column);
       if (!value.ok()) {
-        return Status(value.status().code(),
-                      value.status().message() + " (column " + column.name + ")");
+        return Status(
+            value.status().code(),
+            value.status().message() + " (column " + column.name + ")");
       }
       values[static_cast<size_t>(mapping[i])] = value.TakeValue();
     }
@@ -420,13 +435,14 @@ Status Database::ExecuteInsert(Statement* statement, Transaction* txn,
     if (!tuple.ok()) return tuple.status();
     auto rid = table->heap->Insert(txn, tuple.value());
     if (!rid.ok()) return rid.status();
-    auto index_status = MaintainIndexes(*table, rid.value(), nullptr, &tuple.value());
+    auto index_status =
+        MaintainIndexes(*table, rid.value(), nullptr, &tuple.value());
     if (!index_status.ok()) return index_status;
     ++inserted;
   }
   result->changes = inserted;
-  result->message = "INSERT " + std::to_string(inserted) + " row(s) into " +
-                    table->name;
+  result->message =
+      "INSERT " + std::to_string(inserted) + " row(s) into " + table->name;
   return Status::Ok();
 }
 
@@ -442,57 +458,41 @@ Status Database::ExecuteDelete(Statement* statement, Transaction* txn,
   const Schema& schema = table->schema;
   const DeleteSpec& spec = statement->delete_spec;
 
-  int where_index = -1;
-  Value where_value;
-  if (spec.has_where) {
-    where_index = schema.IndexOf(spec.where_column);
-    if (where_index < 0) {
-      return Status(StatusCode::kNotFound,
-                    "column " + spec.where_column + " does not exist");
-    }
-    auto converted =
-        LiteralToValue(spec.where_value, schema.GetColumn(where_index));
-    if (!converted.ok()) return converted.status();
-    where_value = converted.TakeValue();
-    if (where_value.IsNull()) {
-      return Status(StatusCode::kInvalidArgument,
-                    "WHERE NULL is not supported");
-    }
-  }
+  auto filter = BindWhere(schema, spec);
+  if (!filter.ok()) return filter.status();
 
-  // Collect first: deleting a page's last row frees the page, so mutating the
-  // heap while the scan holds a guard on that page is not safe.
+  // Collect first: deleting a page's last row frees the page, so the heap
+  // must not change while a scan holds a guard on that page.
   std::vector<RID> matches;
-  auto iterator = table->heap->Scan(txn);
-  RID rid;
-  Tuple tuple;
-  while (iterator.Next(&rid, &tuple)) {
-    if (where_index >= 0) {
-      auto decoded = Tuple::Decode(schema, tuple.data().data(), tuple.size());
-      if (!decoded.ok()) return decoded.status();
-      const std::vector<Value>& values = decoded.value();
-      if (!Matches(values[static_cast<size_t>(where_index)], spec.where_op,
-                   where_value)) {
-        continue;
-      }
-    }
-    matches.push_back(rid);
-  }
-  if (!iterator.status().ok()) return iterator.status();
+  auto index = FindRows(*table, txn, filter.value(),
+                        [&](RID rid, const Tuple&, const std::vector<Value>&) {
+                          matches.push_back(rid);
+                          return true;
+                        });
+  if (!index.ok()) return index.status();
 
+  const bool indexed = HasIndexes(*table);
   int deleted = 0;
   for (const RID& target : matches) {
-    auto old_tuple = table->heap->Get(txn, target);
-    if (!old_tuple.ok()) return old_tuple.status();
+    Tuple old_tuple;  // only index maintenance needs the deleted values
+    if (indexed) {
+      auto fetched = table->heap->Get(txn, target);
+      if (!fetched.ok()) return fetched.status();
+      old_tuple = fetched.TakeValue();
+    }
     const Status status = table->heap->Delete(txn, target);
     if (!status.ok()) return status;
-    auto index_status = MaintainIndexes(*table, target, &old_tuple.value(), nullptr);
-    if (!index_status.ok()) return index_status;
+    if (indexed) {
+      const Status index_status =
+          MaintainIndexes(*table, target, &old_tuple, nullptr);
+      if (!index_status.ok()) return index_status;
+    }
     ++deleted;
   }
   result->changes = deleted;
-  result->message = "DELETE " + std::to_string(deleted) + " row(s) from " +
-                    table->name;
+  result->message =
+      "DELETE " + std::to_string(deleted) + " row(s) from " + table->name;
+  NoteIndexScan(result, index.value());
   return Status::Ok();
 }
 
@@ -512,9 +512,9 @@ Status Database::ExecuteUpdate(Statement* statement, Transaction* txn,
   for (const Assignment& assignment : spec.assignments) {
     const int index = schema.IndexOf(assignment.column);
     if (index < 0) {
-      return Status(StatusCode::kNotFound,
-                    "column " + assignment.column + " does not exist in table " +
-                        table->name);
+      return Status(StatusCode::kNotFound, "column " + assignment.column +
+                                               " does not exist in table " +
+                                               table->name);
     }
     for (const auto& existing : assignments) {
       if (existing.first == static_cast<size_t>(index)) {
@@ -531,42 +531,19 @@ Status Database::ExecuteUpdate(Statement* statement, Transaction* txn,
     assignments.emplace_back(static_cast<size_t>(index), value.TakeValue());
   }
 
-  int where_index = -1;
-  Value where_value;
-  if (spec.has_where) {
-    where_index = schema.IndexOf(spec.where_column);
-    if (where_index < 0) {
-      return Status(StatusCode::kNotFound,
-                    "column " + spec.where_column + " does not exist");
-    }
-    auto converted =
-        LiteralToValue(spec.where_value, schema.GetColumn(where_index));
-    if (!converted.ok()) return converted.status();
-    where_value = converted.TakeValue();
-    if (where_value.IsNull()) {
-      return Status(StatusCode::kInvalidArgument,
-                    "WHERE NULL is not supported");
-    }
-  }
+  auto filter = BindWhere(schema, spec);
+  if (!filter.ok()) return filter.status();
 
-  // Collect first, like DELETE: an update may move a row to a later page,
-  // and the scan must not see it twice (or hold a guard we need to write).
+  // Collect first, like DELETE: an update may move a row to a later page or a
+  // later index position, and the scan must not see it twice.
   std::vector<std::pair<RID, Tuple>> matches;
-  auto iterator = table->heap->Scan(txn);
-  RID rid;
-  Tuple tuple;
-  while (iterator.Next(&rid, &tuple)) {
-    if (where_index >= 0) {
-      auto decoded = Tuple::Decode(schema, tuple.data().data(), tuple.size());
-      if (!decoded.ok()) return decoded.status();
-      if (!Matches(decoded.value()[static_cast<size_t>(where_index)],
-                   spec.where_op, where_value)) {
-        continue;
-      }
-    }
-    matches.emplace_back(rid, std::move(tuple));
-  }
-  if (!iterator.status().ok()) return iterator.status();
+  auto index =
+      FindRows(*table, txn, filter.value(),
+               [&](RID rid, const Tuple& tuple, const std::vector<Value>&) {
+                 matches.emplace_back(rid, tuple);
+                 return true;
+               });
+  if (!index.ok()) return index.status();
 
   int updated = 0;
   for (const auto& [target, old_tuple] : matches) {
@@ -579,14 +556,67 @@ Status Database::ExecuteUpdate(Statement* statement, Transaction* txn,
     if (!new_tuple.ok()) return new_tuple.status();
     auto status = table->heap->Update(txn, target, new_tuple.value());
     if (!status.ok()) return status.status();
-    auto index_status = MaintainIndexes(*table, target, &old_tuple, &new_tuple.value());
+    auto index_status =
+        MaintainIndexes(*table, target, &old_tuple, &new_tuple.value());
     if (!index_status.ok()) return index_status;
     ++updated;
   }
   result->changes = updated;
-  result->message = "UPDATE " + std::to_string(updated) + " row(s) in " +
-                    table->name;
+  result->message =
+      "UPDATE " + std::to_string(updated) + " row(s) in " + table->name;
+  NoteIndexScan(result, index.value());
   return Status::Ok();
+}
+
+Result<BPlusTree*> Database::FindRows(const TableInfo& table, Transaction* txn,
+                                      const RowFilter& filter,
+                                      const RowVisitor& visit) {
+  const Schema& schema = table.schema;
+  // "<>" matches almost every row: a heap scan beats one random heap read per
+  // index entry, so only the other operators use an index.
+  BPlusTree* index = filter.column >= 0 && filter.op != CompareOp::kNe
+                         ? FindIndex(table, static_cast<size_t>(filter.column))
+                         : nullptr;
+  if (index) {
+    Status row_status;
+    const Status status =
+        index->Scan(filter.op, filter.value, [&](const IndexEntry& entry) {
+          auto tuple = table.heap->Get(txn, entry.rid);
+          if (!tuple.ok()) {
+            row_status = tuple.status();
+            return false;
+          }
+          auto values = Tuple::Decode(schema, tuple.value().data().data(),
+                                      tuple.value().size());
+          if (!values.ok()) {
+            row_status = values.status();
+            return false;
+          }
+          return visit(entry.rid, tuple.value(), values.value());
+        });
+    if (!status.ok()) return status;
+    if (!row_status.ok()) return row_status;
+    return index;
+  }
+
+  auto iterator = table.heap->Scan(txn);
+  RID rid;
+  Tuple tuple;
+  while (iterator.Next(&rid, &tuple)) {
+    auto values = Tuple::Decode(schema, tuple.data().data(), tuple.size());
+    if (!values.ok()) return values.status();
+    if (filter.column >= 0) {
+      // A NULL column value satisfies no comparison.
+      const Value& value = values.value()[filter.column];
+      if (value.IsNull() ||
+          !Satisfies(CompareValues(value, filter.value), filter.op)) {
+        continue;
+      }
+    }
+    if (!visit(rid, tuple, values.value())) break;
+  }
+  if (!iterator.status().ok()) return iterator.status();
+  return static_cast<BPlusTree*>(nullptr);
 }
 
 Status Database::ExecuteSelect(Statement* statement, Transaction* txn,
@@ -610,7 +640,8 @@ Status Database::ExecuteSelect(Statement* statement, Transaction* txn,
   } else {
     for (const std::string& name : spec.columns) {
       if (name == "*") {
-        for (size_t i = 0; i < schema.num_columns(); ++i) projection.push_back(i);
+        for (size_t i = 0; i < schema.num_columns(); ++i)
+          projection.push_back(i);
         continue;
       }
       if (is_rid(name)) {
@@ -619,9 +650,9 @@ Status Database::ExecuteSelect(Statement* statement, Transaction* txn,
       }
       const int index = schema.IndexOf(name);
       if (index < 0) {
-        return Status(StatusCode::kNotFound,
-                      "column " + name + " does not exist in table " +
-                          table->name);
+        return Status(
+            StatusCode::kNotFound,
+            "column " + name + " does not exist in table " + table->name);
       }
       projection.push_back(static_cast<size_t>(index));
     }
@@ -630,8 +661,8 @@ Status Database::ExecuteSelect(Statement* statement, Transaction* txn,
     if (index == kRidProjection) {
       result->columns.push_back({kRidColumn, TypeId::kVarchar});
     } else {
-      result->columns.push_back({schema.GetColumn(index).name,
-                                 schema.GetColumn(index).type});
+      result->columns.push_back(
+          {schema.GetColumn(index).name, schema.GetColumn(index).type});
     }
   }
   const auto emit = [&](RID rid, const std::vector<Value>& values) {
@@ -646,7 +677,7 @@ Status Database::ExecuteSelect(Statement* statement, Transaction* txn,
 
   // WHERE rid = 'page:slot' is a direct lookup instead of a scan.
   if (spec.has_where && is_rid(spec.where_column)) {
-    if (spec.where_op != "=" ||
+    if (spec.where_op != CompareOp::kEq ||
         spec.where_value.kind != Literal::Kind::kString) {
       return Status(StatusCode::kInvalidArgument,
                     "only rid = 'page:slot' is supported");
@@ -668,62 +699,18 @@ Status Database::ExecuteSelect(Statement* statement, Transaction* txn,
     return Status::Ok();
   }
 
-  int where_index = -1;
-  Value where_value;
-  if (spec.has_where) {
-    where_index = schema.IndexOf(spec.where_column);
-    if (where_index < 0) {
-      return Status(StatusCode::kNotFound,
-                    "column " + spec.where_column + " does not exist");
-    }
-    auto converted =
-        LiteralToValue(spec.where_value, schema.GetColumn(where_index));
-    if (!converted.ok()) return converted.status();
-    where_value = converted.TakeValue();
-    if (where_value.IsNull()) {
-      return Status(StatusCode::kInvalidArgument,
-                    "WHERE NULL is not supported");
-    }
-  }
-
-  if (where_index >= 0) {
-    if (auto* index = FindIndex(*table, static_cast<size_t>(where_index))) {
-      result->message = "INDEX SCAN " + index->metadata().name;
-      if (spec.limit == 0) return Status::Ok();
-      Status lookup_status;
-      auto status = index->Scan(spec.where_op, where_value, [&](const IndexEntry& entry) {
-        auto tuple = table->heap->Get(txn, entry.rid);
-        if (!tuple.ok()) { lookup_status = tuple.status(); return false; }
-        auto values = Tuple::Decode(schema, tuple.value().data().data(), tuple.value().size());
-        if (!values.ok()) { lookup_status = values.status(); return false; }
-        if (Matches(values.value()[where_index], spec.where_op, where_value))
-          emit(entry.rid, values.value());
-        return spec.limit < 0 || static_cast<int64_t>(result->rows.size()) < spec.limit;
-      });
-      if (!status.ok()) return status;
-      return lookup_status;
-    }
-  }
-
-  int64_t emitted = 0;
-  auto iterator = table->heap->Scan(txn);
-  RID rid;
-  Tuple tuple;
-  while (iterator.Next(&rid, &tuple)) {
-    if (spec.limit >= 0 && emitted >= spec.limit) break;
-    auto decoded =
-        Tuple::Decode(schema, tuple.data().data(), tuple.size());
-    if (!decoded.ok()) return decoded.status();
-    const std::vector<Value>& values = decoded.value();
-    if (where_index >= 0 &&
-        !Matches(values[static_cast<size_t>(where_index)], spec.where_op,
-                 where_value)) {
-      continue;
-    }
-    emit(rid, values);
-    ++emitted;
-  }
-  if (!iterator.status().ok()) return iterator.status();
+  auto filter = BindWhere(schema, spec);
+  if (!filter.ok()) return filter.status();
+  if (spec.limit == 0) return Status::Ok();
+  auto index =
+      FindRows(*table, txn, filter.value(),
+               [&](RID rid, const Tuple&, const std::vector<Value>& values) {
+                 emit(rid, values);
+                 return spec.limit < 0 ||
+                        static_cast<int64_t>(result->rows.size()) < spec.limit;
+               });
+  if (!index.ok()) return index.status();
+  NoteIndexScan(result, index.value());
   return Status::Ok();
 }
 
@@ -792,9 +779,9 @@ Status Database::ExecuteCopy(Statement* statement, Transaction* txn,
       literal.text = std::move(fields[i]);
       auto value = LiteralToValue(literal, column);
       if (!value.ok()) {
-        return fail(Status(value.status().code(), value.status().message() +
-                                                      " (column " +
-                                                      column.name + ")"));
+        return fail(
+            Status(value.status().code(),
+                   value.status().message() + " (column " + column.name + ")"));
       }
       values[i] = value.TakeValue();
     }
@@ -802,18 +789,20 @@ Status Database::ExecuteCopy(Statement* statement, Transaction* txn,
     if (!tuple.ok()) return fail(tuple.status());
     auto rid = table->heap->Insert(txn, tuple.value());
     if (!rid.ok()) return fail(rid.status());
-    auto index_status = MaintainIndexes(*table, rid.value(), nullptr, &tuple.value());
+    auto index_status =
+        MaintainIndexes(*table, rid.value(), nullptr, &tuple.value());
     if (!index_status.ok()) return fail(index_status);
     ++loaded;
     if (loaded % 100000 == 0) {
-      MINIDB_LOG_INFO("LOAD") << table->name << " rows=" << loaded
-                              << " pages=" << table->segment->page_count()
-                              << " hit_rate="
-                              << std::round(pool_->Stats().HitRate() * 100) / 100
-                              << "%";
+      MINIDB_LOG_INFO("LOAD")
+          << table->name << " rows=" << loaded
+          << " pages=" << table->segment->page_count()
+          << " hit_rate=" << std::round(pool_->Stats().HitRate() * 100) / 100
+          << "%";
     }
   }
-  if (input.bad()) return Status(StatusCode::kIoError, "error reading " + spec.path);
+  if (input.bad())
+    return Status(StatusCode::kIoError, "error reading " + spec.path);
 
   const double seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
