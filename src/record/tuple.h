@@ -24,6 +24,11 @@ class Tuple {
   static Result<std::vector<Value>> Decode(const Schema& schema,
                                            const std::byte* data,
                                            size_t length);
+  // Decodes only the requested schema ordinals, in the requested order.
+  // Values needed to locate later VARCHAR columns are read but not returned.
+  static Result<std::vector<Value>> DecodeColumns(
+      const Schema& schema, const std::byte* data, size_t length,
+      const std::vector<size_t>& columns);
   static Tuple FromRaw(std::vector<std::byte> data) {
     Tuple tuple;
     tuple.data_ = std::move(data);

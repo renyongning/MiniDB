@@ -133,6 +133,44 @@ Status ValidateValue(const Column& column, const Value& value) {
   return Status::Ok();
 }
 
+Result<Value> DecodeFixedValue(const Column& column, const std::byte* cell) {
+  switch (column.type) {
+    case TypeId::kInt32: {
+      int32_t v;
+      std::memcpy(&v, cell, sizeof(v));
+      return Value::Int32(v);
+    }
+    case TypeId::kInt64: {
+      int64_t v;
+      std::memcpy(&v, cell, sizeof(v));
+      return Value::Int64(v);
+    }
+    case TypeId::kDouble: {
+      double v;
+      std::memcpy(&v, cell, sizeof(v));
+      return Value::Double(v);
+    }
+    case TypeId::kDecimal: {
+      int64_t v;
+      std::memcpy(&v, cell, sizeof(v));
+      return Value::Decimal(v, column.scale);
+    }
+    case TypeId::kDate: {
+      int32_t v;
+      std::memcpy(&v, cell, sizeof(v));
+      return Value::Date(v);
+    }
+    case TypeId::kChar: {
+      std::string text(reinterpret_cast<const char*>(cell), column.length);
+      while (!text.empty() && text.back() == ' ') text.pop_back();
+      return Value::String(std::move(text));
+    }
+    case TypeId::kVarchar:
+      break;
+  }
+  return Status(StatusCode::kCorruption, "not a fixed-width column");
+}
+
 }  // namespace
 
 Result<Tuple> Tuple::FromValues(const Schema& schema,
@@ -299,6 +337,70 @@ Result<std::vector<Value>> Tuple::Decode(const Schema& schema,
     (void)var_index_seen;
   }
 
+  return values;
+}
+
+Result<std::vector<Value>> Tuple::DecodeColumns(
+    const Schema& schema, const std::byte* data, size_t length,
+    const std::vector<size_t>& columns) {
+  if (length < kHeaderSize) {
+    return Status(StatusCode::kCorruption, "tuple shorter than record header");
+  }
+  const size_t null_bytes = schema.null_bitmap_size();
+  const size_t fixed_start = kHeaderSize + null_bytes;
+  const size_t var_offset_start = fixed_start + schema.fixed_size();
+  const size_t var_data_start = var_offset_start + schema.var_count() * 2;
+  if (length < var_data_start) {
+    return Status(StatusCode::kCorruption, "tuple shorter than schema layout");
+  }
+  std::vector<int> slot_of_column(schema.num_columns(), -1);
+  for (size_t i = 0; i < columns.size(); ++i) {
+    if (columns[i] >= schema.num_columns()) {
+      return Status(StatusCode::kCorruption, "decoded column out of range");
+    }
+    slot_of_column[columns[i]] = static_cast<int>(i);
+  }
+  std::vector<Value> values(columns.size());
+  uint16_t previous_var_end = 0;
+  for (size_t i = 0; i < schema.num_columns(); ++i) {
+    const Column& column = schema.GetColumn(i);
+    const int slot = slot_of_column[i];
+    const bool is_null =
+        (data[kHeaderSize + i / 8] & static_cast<std::byte>(1u << (i % 8))) !=
+        std::byte{0};
+    if (is_null) {
+      if (slot >= 0) {
+        if (!column.nullable) {
+          return Status(StatusCode::kCorruption,
+                        "NULL bit set on NOT NULL column " + column.name);
+        }
+        values[slot] = Value::Null();
+      }
+      continue;
+    }
+    if (Schema::IsFixedType(column.type)) {
+      if (slot < 0) continue;
+      auto value =
+          DecodeFixedValue(column, data + fixed_start + schema.fixed_offset(i));
+      if (!value.ok()) return value.status();
+      values[slot] = value.TakeValue();
+    } else {
+      const uint16_t entry = schema.var_entry_offset(i);
+      uint16_t end = 0;
+      std::memcpy(&end, data + var_offset_start + entry, sizeof(end));
+      if (end < previous_var_end || var_data_start + end > length) {
+        return Status(StatusCode::kCorruption,
+                      "invalid VARCHAR offset in tuple");
+      }
+      if (slot >= 0) {
+        const size_t start = var_data_start + previous_var_end;
+        values[slot] = Value::String(std::string(
+            reinterpret_cast<const char*>(data + start),
+            end - previous_var_end));
+      }
+      previous_var_end = end;
+    }
+  }
   return values;
 }
 

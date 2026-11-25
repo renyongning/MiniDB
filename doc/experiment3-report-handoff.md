@@ -97,8 +97,9 @@ python3 scripts/spj_figure.py doc/exp3-evidence/tpch-results.txt doc/exp3-eviden
 | 文件 | 关注内容 |
 | --- | --- |
 | `src/sql/parser.h/.cpp` | TableRef、SelectOperand、SelectPredicate；限定列、别名、AND/BETWEEN、JOIN、EXPLAIN |
-| `src/db/select.cpp` | 名称/类型绑定、条件归属、扫描路径、IndexJoin、三表调度、投影、LIMIT、逻辑内存预算 |
-| `src/execution/spj.h/.cpp` | Row/Rows、复合键、NestedLoop、SortMerge、HashJoin、重复组乘积与散列碰撞校验 |
+| `src/query/select_binder.*`、`select_plan.h` | 名称/类型绑定、条件归属、列裁剪与逐级布局、扫描路径、IndexJoin、三表调度、逻辑计划 |
+| `src/db/select.cpp` | 薄入口：Binder → Executor，或输出 EXPLAIN |
+| `src/execution/exec_state.h`、`*_state.cpp`、`executor.cpp` | 火山模型 PlanState（扫描/连接/投影）、延迟物化、LIMIT、逻辑内存预算与执行消息 |
 | `src/index/bplus_tree.cpp` | DATE 元数据支持、整数天数编码、重开、日期键显示 |
 | `src/db/pragma.cpp` | 算法选择、扫描方式、预算会话设置 |
 | `tests/test_spj.cpp` | 独立参考模型，反向谓词、NULL/重复/边界/三表/错误处理 |

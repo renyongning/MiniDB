@@ -357,6 +357,8 @@ src/table/                slotted heap pages, table heap, iterators
 src/catalog/              system catalog bootstrap and DDL metadata
 src/sql/                  lexer + recursive-descent parser
 src/db/                   statement execution, COPY, PRAGMA
+src/query/                SELECT binding, column pruning, physical plan
+src/execution/            Volcano PlanState operators and executor driver
 src/capi/                 C API wrapper
 tools/shell/              minidb_shell
 examples/demo.cpp         embedded demo

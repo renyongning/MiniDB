@@ -32,7 +32,12 @@ set(MINIDB_CORE_SOURCES
     src/sql/parser.cpp
     src/index/bplus_tree.cpp
     src/db/index.cpp
-    src/execution/spj.cpp
+    src/query/select_binder.cpp
+    src/execution/exec_state.cpp
+    src/execution/scan_state.cpp
+    src/execution/join_state.cpp
+    src/execution/projection_state.cpp
+    src/execution/executor.cpp
     src/db/select.cpp
     src/db/database.cpp
     src/db/pragma.cpp

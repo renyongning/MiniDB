@@ -247,9 +247,16 @@ void All() {
   CHECK(Exec(*db, "SELECT * FROM a JOIN empty ON a.id=empty.id").rows.empty());
   CHECK(Exec(*db, "SELECT * FROM empty,a").rows.empty());
   Exec(*db, "PRAGMA query_memory=4096");
-  auto over = db->Execute("SELECT * FROM a,b", nullptr);
+  // The budget covers operator-internal state (hash/sort builds, index RID
+  // lists); the result set is delivered through QueryResult and is not
+  // charged, so streaming scans and nested loops run under a tiny budget.
+  CHECK(Exec(*db, "SELECT * FROM a,b").rows.size() == 38 * 38);
+  SetAlgorithm(*db, "hash");
+  auto over = db->Execute("SELECT * FROM a JOIN b ON a.id=b.id", nullptr);
   CHECK(!over.ok() && over.code() == StatusCode::kNoSpace);
+  SetAlgorithm(*db, "auto");
   CHECK(Exec(*db, "SELECT * FROM a LIMIT 1").rows.size() == 1);
+  CHECK(Exec(*db, "SELECT * FROM a").rows.size() == 38);
   Exec(*db, "PRAGMA query_memory=67108864");
   // DATE maintenance and persisted reopen use the same index file format.
   Exec(*db,
