@@ -16,9 +16,6 @@
 namespace minidb {
 namespace {
 
-constexpr const char* kRidColumn = "rid";
-constexpr size_t kRidProjection = static_cast<size_t>(-1);
-
 Result<int64_t> LiteralToInteger(const Literal& literal) {
   switch (literal.kind) {
     case Literal::Kind::kInteger:
@@ -72,6 +69,8 @@ Result<double> LiteralToDouble(const Literal& literal) {
   return Status(StatusCode::kTypeMismatch, "expected a number");
 }
 
+}  // namespace
+
 Result<Value> LiteralToValue(const Literal& literal, const Column& column) {
   if (literal.kind == Literal::Kind::kNull) return Value::Null();
   switch (column.type) {
@@ -114,6 +113,8 @@ Result<Value> LiteralToValue(const Literal& literal, const Column& column) {
   }
   return Status(StatusCode::kTypeMismatch, "unsupported column type");
 }
+
+namespace {
 
 // Binds the optional `WHERE column op literal` of a statement to a table.
 template <class Spec>
@@ -617,101 +618,6 @@ Result<BPlusTree*> Database::FindRows(const TableInfo& table, Transaction* txn,
   }
   if (!iterator.status().ok()) return iterator.status();
   return static_cast<BPlusTree*>(nullptr);
-}
-
-Status Database::ExecuteSelect(Statement* statement, Transaction* txn,
-                               QueryResult* result) {
-  auto table_result = catalog_->GetTable(statement->table_name);
-  if (!table_result.ok()) return table_result.status();
-  TableInfo* table = table_result.value();
-  const Schema& schema = table->schema;
-  const SelectSpec& spec = statement->select;
-
-  // "rid" is a pseudo-column ("page:slot", like PostgreSQL's ctid) unless the
-  // table has a real column with that name.
-  const bool has_rid_column = schema.IndexOf(kRidColumn) >= 0;
-  const auto is_rid = [&](const std::string& name) {
-    return !has_rid_column && ToLower(name) == kRidColumn;
-  };
-
-  std::vector<size_t> projection;
-  if (spec.star) {
-    for (size_t i = 0; i < schema.num_columns(); ++i) projection.push_back(i);
-  } else {
-    for (const std::string& name : spec.columns) {
-      if (name == "*") {
-        for (size_t i = 0; i < schema.num_columns(); ++i)
-          projection.push_back(i);
-        continue;
-      }
-      if (is_rid(name)) {
-        projection.push_back(kRidProjection);
-        continue;
-      }
-      const int index = schema.IndexOf(name);
-      if (index < 0) {
-        return Status(
-            StatusCode::kNotFound,
-            "column " + name + " does not exist in table " + table->name);
-      }
-      projection.push_back(static_cast<size_t>(index));
-    }
-  }
-  for (size_t index : projection) {
-    if (index == kRidProjection) {
-      result->columns.push_back({kRidColumn, TypeId::kVarchar});
-    } else {
-      result->columns.push_back(
-          {schema.GetColumn(index).name, schema.GetColumn(index).type});
-    }
-  }
-  const auto emit = [&](RID rid, const std::vector<Value>& values) {
-    std::vector<Value> row;
-    row.reserve(projection.size());
-    for (size_t index : projection) {
-      row.push_back(index == kRidProjection ? Value::String(FormatRid(rid))
-                                            : values[index]);
-    }
-    result->rows.push_back(std::move(row));
-  };
-
-  // WHERE rid = 'page:slot' is a direct lookup instead of a scan.
-  if (spec.has_where && is_rid(spec.where_column)) {
-    if (spec.where_op != CompareOp::kEq ||
-        spec.where_value.kind != Literal::Kind::kString) {
-      return Status(StatusCode::kInvalidArgument,
-                    "only rid = 'page:slot' is supported");
-    }
-    auto rid = ParseRid(spec.where_value.text);
-    if (!rid.ok()) return rid.status();
-    auto tuple = table->heap->Get(txn, rid.value());
-    if (!tuple.ok()) {
-      if (tuple.status().code() == StatusCode::kNotFound) {
-        return Status::Ok();  // no such row: empty result
-      }
-      return tuple.status();
-    }
-    if (spec.limit == 0) return Status::Ok();
-    auto decoded = Tuple::Decode(schema, tuple.value().data().data(),
-                                 tuple.value().size());
-    if (!decoded.ok()) return decoded.status();
-    emit(rid.value(), decoded.value());
-    return Status::Ok();
-  }
-
-  auto filter = BindWhere(schema, spec);
-  if (!filter.ok()) return filter.status();
-  if (spec.limit == 0) return Status::Ok();
-  auto index =
-      FindRows(*table, txn, filter.value(),
-               [&](RID rid, const Tuple&, const std::vector<Value>& values) {
-                 emit(rid, values);
-                 return spec.limit < 0 ||
-                        static_cast<int64_t>(result->rows.size()) < spec.limit;
-               });
-  if (!index.ok()) return index.status();
-  NoteIndexScan(result, index.value());
-  return Status::Ok();
 }
 
 Status Database::ExecuteCopy(Statement* statement, Transaction* txn,

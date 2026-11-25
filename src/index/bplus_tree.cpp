@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <queue>
 #include <set>
 #include <sstream>
@@ -49,7 +50,8 @@ std::string_view TrimmedRight(std::string_view text) {
   return text;
 }
 int64_t IntegerOf(const Value& key) {
-  return key.kind == ValueKind::kInt32 ? key.int32_value : key.int64_value;
+  return key.kind == ValueKind::kInt32 || key.kind == ValueKind::kDate
+             ? key.int32_value : key.int64_value;
 }
 int CompareRids(RID a, RID b) {
   if (a.page_id != b.page_id) return a.page_id < b.page_id ? -1 : 1;
@@ -250,7 +252,9 @@ class BPlusTree::Node {
   IndexEntry entry(size_t i) const {
     const std::byte* slot = Slot(i);
     return {tree_.string_keys_ ? Value::String(std::string(StringKey(slot)))
-                               : Value::Int64(IntegerKey(slot)),
+                               : tree_.metadata_.type == TypeId::kDate
+                                     ? Value::Date(static_cast<int32_t>(IntegerKey(slot)))
+                                     : Value::Int64(IntegerKey(slot)),
             Rid(slot)};
   }
   std::vector<IndexEntry> entries() const {
@@ -393,10 +397,10 @@ BPlusTree::BPlusTree(BufferPool& pool, DiskManager::Ptr disk,
 }
 
 Status BPlusTree::ValidateMetadata(const IndexMetadata& m) {
-  if (m.type != TypeId::kInt32 && m.type != TypeId::kInt64 &&
+  if (m.type != TypeId::kInt32 && m.type != TypeId::kInt64 && m.type != TypeId::kDate &&
       !StringType(m.type))
     return Status(StatusCode::kNotSupported,
-                  "indexes support INTEGER, BIGINT, CHAR and VARCHAR");
+                  "indexes support INTEGER, BIGINT, DATE, CHAR and VARCHAR");
   if (StringType(m.type) && (m.length == 0 || m.length > 4000))
     return Status(StatusCode::kNotSupported,
                   "index string length must be 1..4000");
@@ -486,9 +490,13 @@ Status BPlusTree::CheckKey(const Value& key) const {
       return Status(StatusCode::kTypeMismatch, "expected string index key");
     if (key.string_value.size() > metadata_.length)
       return Status(StatusCode::kInvalidArgument, "index key too long");
-  } else if (key.kind != ValueKind::kInt32 && key.kind != ValueKind::kInt64) {
+  } else if (key.kind != ValueKind::kInt32 && key.kind != ValueKind::kInt64 && key.kind != ValueKind::kDate) {
     return Status(StatusCode::kTypeMismatch, "expected integer index key");
   }
+  if (metadata_.type == TypeId::kDate &&
+      (IntegerOf(key) < std::numeric_limits<int32_t>::min() ||
+       IntegerOf(key) > std::numeric_limits<int32_t>::max()))
+    return Status(StatusCode::kInvalidArgument, "date index key out of range");
   return Status::Ok();
 }
 
@@ -1029,7 +1037,7 @@ Status BPlusTree::Scan(CompareOp op, const Value& key,
   if (key.IsNull()) return Status::Ok();  // NULL compares true with nothing
   if (string_keys_
           ? key.kind != ValueKind::kString
-          : key.kind != ValueKind::kInt32 && key.kind != ValueKind::kInt64)
+          : key.kind != ValueKind::kInt32 && key.kind != ValueKind::kInt64 && key.kind != ValueKind::kDate)
     return Status(StatusCode::kTypeMismatch, "wrong index bound type");
   // Operators bounded below start at the key's leaf, the rest at the leftmost
   // leaf; operators bounded above stop at the first entry past the key.

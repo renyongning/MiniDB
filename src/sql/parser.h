@@ -34,13 +34,22 @@ struct InsertSpec {
   std::vector<std::vector<Literal>> rows;
 };
 
+struct SelectOperand {
+  bool is_column = true;
+  std::string column;
+  Literal literal;
+};
+struct SelectPredicate {
+  SelectOperand left, right;
+  CompareOp op = CompareOp::kEq;
+};
+struct TableRef { std::string name, alias; };
+
 struct SelectSpec {
+  std::vector<TableRef> from;
+  std::vector<SelectPredicate> predicates;
+  bool explain = false;
   std::vector<std::string> columns;  // may contain "*" next to column names
-  bool star = false;
-  std::string where_column;
-  CompareOp where_op = CompareOp::kEq;
-  Literal where_value;
-  bool has_where = false;
   int64_t limit = -1;
 };
 

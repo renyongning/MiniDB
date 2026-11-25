@@ -651,6 +651,8 @@ Status PragmaList(PragmaContext& ctx) {
   SetColumns(ctx.result, {{"name", TypeId::kVarchar},
                           {"arguments", TypeId::kVarchar},
                           {"description", TypeId::kVarchar}});
+  for (const auto* name : {"join_algorithm", "scan_method", "query_memory"})
+    ctx.result->rows.push_back({Text(name), Text("[= value]"), Text("SPJ session setting")});
   for (const PragmaEntry& entry : kPragmas) {
     ctx.result->rows.push_back(
         {Text(entry.name), Text(entry.arguments), Text(entry.description)});
@@ -665,6 +667,33 @@ Status Database::ExecutePragma(Statement* statement, Transaction* txn,
   PragmaContext ctx{statement->pragma,         *catalog_, *pool_, indexes_,
                     config_.index_sort_memory, txn,       result};
   const std::string name = ToLower(statement->pragma.name);
+  if (name == "join_algorithm" || name == "scan_method" || name == "query_memory") {
+    const auto& spec = statement->pragma;
+    if (!spec.args.empty()) return Status(StatusCode::kInvalidArgument, "use PRAGMA name = value");
+    if (name == "query_memory") {
+      if (spec.has_value) {
+        if (spec.value.kind != Literal::Kind::kInteger || spec.value.integer < 4096 || spec.value.integer > (1LL << 34))
+          return Status(StatusCode::kInvalidArgument, "query_memory must be 4096..17179869184 bytes");
+        query_memory_ = static_cast<size_t>(spec.value.integer);
+      }
+      result->columns = {{name, TypeId::kInt64}};
+      result->rows = {{Value::Int64(query_memory_)}};
+    } else {
+      auto& setting = name == "join_algorithm" ? join_algorithm_ : scan_method_;
+      if (spec.has_value) {
+        const auto value = ToLower(spec.value.text);
+        const bool valid = name == "join_algorithm" ?
+            (value == "auto" || value == "nested_loop" || value == "sort_merge" || value == "hash" || value == "index") :
+            (value == "auto" || value == "table" || value == "index");
+        if (!valid) return Status(StatusCode::kInvalidArgument, "invalid " + name + ": " + value);
+        setting = value;
+      }
+      result->columns = {{name, TypeId::kVarchar}};
+      result->rows = {{Value::String(setting)}};
+    }
+    return Status::Ok();
+  }
+
   for (const PragmaEntry& entry : kPragmas) {
     if (name == entry.name) return entry.run(ctx);
   }

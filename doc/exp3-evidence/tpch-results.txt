@@ -1,0 +1,35 @@
+2026-11-25 | macOS arm64 | Clang 17 | Release | 32 buffer frames
+supplier=10000 nation=25 region=5 orders_prefix=50000 buffer_frames=32
+table integer_range rows=228 ms=31.3382 SPJ rows=228 candidates=0 probes=0 OK
+table string_ne rows=39996 ms=58.1101 SPJ rows=39996 candidates=0 probes=0 OK
+table date_range rows=7552 ms=35.3403 SPJ rows=7552 candidates=0 probes=0 OK
+table mixed_conditions rows=207 ms=30.0551 SPJ rows=207 candidates=0 probes=0 OK
+index integer_range rows=228 ms=36.1105 SPJ rows=228 candidates=0 probes=0 OK
+index string_ne rows=39996 ms=85.2128 SPJ rows=39996 candidates=0 probes=0 OK
+index date_range rows=7552 ms=425.85 SPJ rows=7552 candidates=0 probes=0 OK
+index mixed_conditions rows=207 ms=0.292542 SPJ rows=207 candidates=0 probes=0 OK
+nested_loop integer_join rows=10000 ms=19.0285 SPJ rows=10000 candidates=250000 probes=0 OK
+nested_loop three_tables rows=10000 ms=21.3506 SPJ rows=10000 candidates=300000 probes=0 OK
+nested_loop composite rows=100 ms=0.415709 SPJ rows=100 candidates=10000 probes=0 OK
+nested_loop date_join rows=57 ms=0.190417 SPJ rows=57 candidates=3025 probes=0 OK
+nested_loop string_join rows=651 ms=0.368333 SPJ rows=651 candidates=3025 probes=0 OK
+sort_merge integer_join rows=10000 ms=12.9615 SPJ rows=10000 candidates=10000 probes=0 OK
+sort_merge three_tables rows=10000 ms=16.394 SPJ rows=10000 candidates=20000 probes=0 OK
+sort_merge composite rows=100 ms=0.242 SPJ rows=100 candidates=100 probes=0 OK
+sort_merge date_join rows=57 ms=0.152542 SPJ rows=57 candidates=57 probes=0 OK
+sort_merge string_join rows=651 ms=0.359625 SPJ rows=651 candidates=651 probes=0 OK
+hash integer_join rows=10000 ms=10.6809 SPJ rows=10000 candidates=10000 probes=10000 OK
+hash three_tables rows=10000 ms=13.4907 SPJ rows=10000 candidates=20000 probes=20000 OK
+hash composite rows=100 ms=0.327417 SPJ rows=100 candidates=100 probes=100 OK
+hash date_join rows=57 ms=0.156042 SPJ rows=57 candidates=57 probes=55 OK
+hash string_join rows=651 ms=0.268958 SPJ rows=651 candidates=651 probes=55 OK
+index integer_join rows=10000 ms=15.559 SPJ rows=10000 candidates=10000 probes=10000 OK
+index three_tables rows=10000 ms=26.5467 SPJ rows=10000 candidates=20000 probes=20000 OK
+index composite rows=100 ms=0.384583 SPJ rows=100 candidates=100 probes=100 OK
+index date_join rows=57 ms=17.6471 SPJ rows=57 candidates=1151 probes=55 OK
+index string_join rows=651 ms=946.649 SPJ rows=651 candidates=549184 probes=55 OK
+nested_loop cross rows=125 ms=0.101916 SPJ rows=125 candidates=125 probes=0 OK
+nested_loop theta rows=50 ms=0.028125 SPJ rows=50 candidates=125 probes=0 OK
+index cross rows=125 ms=0.107875 SPJ rows=125 candidates=125 probes=25 OK
+index theta rows=50 ms=0.0425 SPJ rows=50 candidates=50 probes=25 OK
+checks=32 all_reference_results=OK reopen=OK buffer_miss=82931 evict=82899

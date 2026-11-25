@@ -256,6 +256,11 @@ class Parser {
   bool ParseDropTable(Statement* statement);
   bool ParseInsert(Statement* statement);
   bool ParseSelect(Statement* statement);
+  bool ParseColumnRef(std::string* name, bool star = false);
+  bool ParseTableRef(TableRef* table);
+  bool ParseSelectOperand(SelectOperand* operand);
+  bool ParsePredicates(std::vector<SelectPredicate>* predicates);
+  bool ParseComparison(CompareOp* op);
   bool ParseDelete(Statement* statement);
   bool ParseUpdate(Statement* statement);
   bool ParseCopy(Statement* statement);
@@ -305,6 +310,10 @@ bool Parser::ParseStatement(Statement* statement) {
   if (IsKeyword(Peek(), "CREATE")) return ParseCreateTable(statement);
   if (IsKeyword(Peek(), "DROP")) return ParseDropTable(statement);
   if (IsKeyword(Peek(), "INSERT")) return ParseInsert(statement);
+  if (MatchKeyword("EXPLAIN")) {
+    statement->select.explain = true;
+    return ParseSelect(statement);
+  }
   if (IsKeyword(Peek(), "SELECT")) return ParseSelect(statement);
   if (IsKeyword(Peek(), "DELETE")) return ParseDelete(statement);
   if (IsKeyword(Peek(), "UPDATE")) return ParseUpdate(statement);
@@ -631,37 +640,108 @@ bool Parser::ParseLiteral(Literal* literal) {
   return Fail("expected literal");
 }
 
+bool Parser::ParseColumnRef(std::string* name, bool star) {
+  if (star && MatchSymbol("*")) { *name = "*"; return true; }
+  if (!ExpectIdentifier(name)) return false;
+  if (MatchSymbol(".")) {
+    std::string column;
+    if (star && MatchSymbol("*")) column = "*";
+    else if (!ExpectIdentifier(&column)) return false;
+    *name += "." + column;
+  }
+  return true;
+}
+
+bool Parser::ParseTableRef(TableRef* table) {
+  if (!ExpectIdentifier(&table->name)) return false;
+  table->alias = table->name;
+  if (MatchKeyword("AS")) return ExpectIdentifier(&table->alias);
+  if (Peek().type == TokenType::kIdentifier &&
+      !IsKeyword(Peek(), "WHERE") && !IsKeyword(Peek(), "LIMIT") &&
+      !IsKeyword(Peek(), "JOIN") && !IsKeyword(Peek(), "INNER") &&
+      !IsKeyword(Peek(), "CROSS") && !IsKeyword(Peek(), "ON") &&
+      !IsKeyword(Peek(), "LEFT") && !IsKeyword(Peek(), "RIGHT") &&
+      !IsKeyword(Peek(), "FULL") && !IsKeyword(Peek(), "ORDER") &&
+      !IsKeyword(Peek(), "GROUP")) return ExpectIdentifier(&table->alias);
+  return true;
+}
+
+bool Parser::ParseComparison(CompareOp* op) {
+  if (MatchSymbol("=")) *op = CompareOp::kEq;
+  else if (MatchSymbol("!=" ) || MatchSymbol("<>")) *op = CompareOp::kNe;
+  else if (MatchSymbol("<=")) *op = CompareOp::kLe;
+  else if (MatchSymbol(">=")) *op = CompareOp::kGe;
+  else if (MatchSymbol("<")) *op = CompareOp::kLt;
+  else if (MatchSymbol(">")) *op = CompareOp::kGt;
+  else return Fail("expected comparison");
+  return true;
+}
+
+bool Parser::ParseSelectOperand(SelectOperand* operand) {
+  *operand = SelectOperand{};
+  if (IsKeyword(Peek(), "DATE") && Peek(1).type == TokenType::kString) {
+    ++pos_;
+    operand->is_column = false;
+    return ParseLiteral(&operand->literal);
+  }
+  if (Peek().type == TokenType::kIdentifier && !IsKeyword(Peek(), "NULL"))
+    return ParseColumnRef(&operand->column);
+  operand->is_column = false;
+  return ParseLiteral(&operand->literal);
+}
+
+bool Parser::ParsePredicates(std::vector<SelectPredicate>* predicates) {
+  do {
+    if (MatchSymbol("(")) {
+      if (!ParsePredicates(predicates) || !ExpectSymbol(")")) return false;
+      continue;
+    }
+    SelectPredicate p;
+    if (!ParseSelectOperand(&p.left)) return false;
+    if (MatchKeyword("BETWEEN")) {
+      p.op = CompareOp::kGe;
+      if (!ParseSelectOperand(&p.right)) return false;
+      predicates->push_back(p);
+      if (!ExpectKeyword("AND")) return false;
+      p.op = CompareOp::kLe;
+      if (!ParseSelectOperand(&p.right)) return false;
+    } else if (!ParseComparison(&p.op) || !ParseSelectOperand(&p.right)) return false;
+    predicates->push_back(std::move(p));
+  } while (MatchKeyword("AND"));
+  return true;
+}
+
 bool Parser::ParseSelect(Statement* statement) {
   if (!ExpectKeyword("SELECT")) return false;
   statement->type = StatementType::kSelect;
-  // Items are column names or '*'; "SELECT rid, *" mixes both.
-  for (;;) {
+  auto& spec = statement->select;
+  do {
     std::string item;
-    if (MatchSymbol("*")) {
-      item = "*";
-    } else if (!ExpectIdentifier(&item)) {
-      return false;
-    }
-    statement->select.columns.push_back(std::move(item));
-    if (!MatchSymbol(",")) break;
-  }
-  if (statement->select.columns.size() == 1 &&
-      statement->select.columns[0] == "*") {
-    statement->select.star = true;
-    statement->select.columns.clear();
-  }
+    if (!ParseColumnRef(&item, true)) return false;
+    spec.columns.push_back(std::move(item));
+  } while (MatchSymbol(","));
   if (!ExpectKeyword("FROM")) return false;
-  if (!ExpectIdentifier(&statement->table_name)) return false;
-  if (!ParseWhereClause(
-          &statement->select.where_column, &statement->select.where_op,
-          &statement->select.where_value, &statement->select.has_where)) {
-    return false;
+  TableRef first;
+  if (!ParseTableRef(&first)) return false;
+  statement->table_name = first.name;
+  spec.from.push_back(std::move(first));
+  for (;;) {
+    bool on = false;
+    if (MatchSymbol(",")) {}
+    else if (MatchKeyword("CROSS")) { if (!ExpectKeyword("JOIN")) return false; }
+    else if (MatchKeyword("INNER")) { if (!ExpectKeyword("JOIN")) return false; on = true; }
+    else if (MatchKeyword("JOIN")) on = true;
+    else break;
+    TableRef table;
+    if (!ParseTableRef(&table)) return false;
+    spec.from.push_back(std::move(table));
+    if (on && (!ExpectKeyword("ON") || !ParsePredicates(&spec.predicates))) return false;
   }
+  if (MatchKeyword("WHERE") && !ParsePredicates(&spec.predicates)) return false;
   if (MatchKeyword("LIMIT")) {
     int32_t limit = 0;
     if (!ExpectInteger(&limit)) return false;
-    if (limit < 0) return Fail("negative LIMIT");
-    statement->select.limit = limit;
+    spec.limit = limit;
   }
   return true;
 }

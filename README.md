@@ -49,6 +49,24 @@ See [实验二设计与使用说明](doc/experiment2-index.md),
 [acceptance script](scripts/demo_index.txt), and `minidb_verify_index_tpch`
 for a real TPC-H supplier demonstration.
 
+## Experiment 3: SPJ query algorithms
+
+SELECT now supports table aliases, qualified columns, AND/BETWEEN predicates,
+INNER/CROSS joins and multi-table projection. TableScan and IndexScan feed a
+left-deep executor with nested-loop, sort-merge, hash and B+ index joins.
+DATE indexes extend the existing integer-key page representation.
+
+Use `PRAGMA join_algorithm = nested_loop|sort_merge|hash|index|auto` and
+`PRAGMA scan_method = table|index|auto` (choose one value), then
+`EXPLAIN SELECT ...` to inspect the plan without scanning data. Queries have
+a configurable logical materialization budget (`PRAGMA query_memory`).
+
+See [设计与使用说明](doc/experiment3-spj.md),
+[报告与验收交接](doc/experiment3-report-handoff.md), and
+[scripts/demo_spj_small.sql](scripts/demo_spj_small.sql) for a self-contained
+example. `minidb_verify_spj_tpch` checks real data against an independent
+reference; `scripts/demo_spj.txt` demonstrates the resulting database.
+
 ## Build
 
 ```sh
@@ -69,6 +87,8 @@ Build products:
 * `build/minidb_shell` — interactive shell / script runner
 * `build/minidb_demo` — embedded API demo
 * `build/minidb_tests` — integration tests (C API)
+* `build/minidb_spj_tests` — SPJ oracle and SQL regression tests
+* `build/minidb_verify_spj_tpch` — real TPC-H SPJ acceptance verifier
 * `build/minidb_index_tests` — B+ tree randomized and SQL integration tests
 * `build/minidb_verify_index_tpch` — real supplier index acceptance verifier
 * `build/minidb_storage_tests` — storage-layer tests (internal C++ API)

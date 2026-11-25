@@ -48,6 +48,8 @@ struct RowFilter {
   Value value;
 };
 
+Result<Value> LiteralToValue(const Literal& literal, const Column& column);
+
 class Database {
  public:
   static Result<std::unique_ptr<Database>> Open(const Config& config);
@@ -107,6 +109,10 @@ class Database {
                               const RowFilter& filter, const RowVisitor& visit);
   Status MaintainIndexes(const TableInfo& table, RID rid, const Tuple* before,
                          const Tuple* after);
+
+  std::string join_algorithm_ = "auto";
+  std::string scan_method_ = "auto";
+  size_t query_memory_ = 64 << 20;
 
   Config config_;
   // Declaration order is construction order; destruction runs in reverse, so

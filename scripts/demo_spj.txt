@@ -1,0 +1,44 @@
+-- First run minidb_verify_spj_tpch; use its populated database for this script.
+-- ./build/minidb_shell --db /tmp/exp3_acceptance --buffer 32 --file scripts/demo_spj.txt
+.echo on
+.timer on
+PRAGMA join_algorithm;
+PRAGMA query_memory;
+
+-- Three data types and projection. Force both access methods on the same range.
+PRAGMA scan_method = table;
+EXPLAIN SELECT o_orderkey,o_orderpriority,o_orderdate FROM orders WHERE o_orderkey BETWEEN 100 AND 200;
+SELECT o_orderkey,o_orderpriority,o_orderdate FROM orders WHERE o_orderkey BETWEEN 100 AND 200 LIMIT 5;
+PRAGMA scan_method = index;
+EXPLAIN SELECT o_orderkey,o_orderpriority,o_orderdate FROM orders WHERE o_orderkey BETWEEN 100 AND 200;
+SELECT o_orderkey,o_orderpriority,o_orderdate FROM orders WHERE o_orderkey BETWEEN 100 AND 200 LIMIT 5;
+SELECT o_orderkey,o_orderpriority,o_orderdate FROM orders WHERE o_orderpriority != '1-URGENT' LIMIT 5;
+SELECT o_orderkey,o_orderpriority,o_orderdate FROM orders WHERE o_orderdate BETWEEN DATE '1995-01-01' AND DATE '1995-12-31' LIMIT 5;
+SELECT * FROM orders WHERE o_orderkey <= 100 AND o_orderpriority != '1-URGENT' LIMIT 3;
+PRAGMA scan_method = auto;
+
+-- Four physical algorithms, same integer join.
+PRAGMA join_algorithm = nested_loop;
+EXPLAIN SELECT s.s_suppkey,n.n_name FROM supplier s JOIN nation n ON s.s_nationkey=n.n_nationkey;
+SELECT s.s_suppkey,n.n_name FROM supplier s JOIN nation n ON s.s_nationkey=n.n_nationkey LIMIT 5;
+PRAGMA join_algorithm = sort_merge;
+SELECT s.s_suppkey,n.n_name FROM supplier s JOIN nation n ON s.s_nationkey=n.n_nationkey LIMIT 5;
+PRAGMA join_algorithm = hash;
+SELECT s.s_suppkey,n.n_name FROM supplier s JOIN nation n ON s.s_nationkey=n.n_nationkey LIMIT 5;
+PRAGMA join_algorithm = index;
+SELECT s.s_suppkey,n.n_name FROM supplier s JOIN nation n ON s.s_nationkey=n.n_nationkey LIMIT 5;
+
+-- String/date, multiple equality conditions, non-equality and Cartesian product.
+SELECT a.o_orderkey,b.o_orderkey,a.o_orderdate FROM orders a,orders b WHERE a.o_orderdate=b.o_orderdate AND a.o_orderkey<=100 AND b.o_orderkey<=100 LIMIT 5;
+SELECT a.o_orderkey,b.o_orderkey,a.o_orderpriority FROM orders a,orders b WHERE a.o_orderpriority=b.o_orderpriority AND a.o_orderkey<=100 AND b.o_orderkey<=100 LIMIT 5;
+SELECT a.s_suppkey,b.s_name FROM supplier a,supplier b WHERE a.s_suppkey=b.s_suppkey AND a.s_name=b.s_name AND a.s_suppkey<=10 LIMIT 5;
+SELECT n.n_nationkey,r.r_regionkey FROM nation n,region r WHERE n.n_regionkey<r.r_regionkey LIMIT 5;
+SELECT n.n_name,r.r_name FROM nation n CROSS JOIN region r LIMIT 5;
+
+-- Three-table join, with all join conditions applied at their earliest stage.
+PRAGMA join_algorithm = hash;
+EXPLAIN SELECT s.s_suppkey,n.n_name,r.r_name FROM supplier s,nation n,region r WHERE s.s_nationkey=n.n_nationkey AND n.n_regionkey=r.r_regionkey;
+SELECT s.s_suppkey,n.n_name,r.r_name FROM supplier s,nation n,region r WHERE s.s_nationkey=n.n_nationkey AND n.n_regionkey=r.r_regionkey LIMIT 10;
+PRAGMA index_check(o_date);
+PRAGMA buffer_stats;
+PRAGMA join_algorithm = auto;

@@ -32,6 +32,8 @@ set(MINIDB_CORE_SOURCES
     src/sql/parser.cpp
     src/index/bplus_tree.cpp
     src/db/index.cpp
+    src/execution/spj.cpp
+    src/db/select.cpp
     src/db/database.cpp
     src/db/pragma.cpp
     src/capi/minidb_c_api.cpp
@@ -100,9 +102,17 @@ if(MINIDB_BUILD_TESTS)
   target_link_libraries(minidb_index_tests PRIVATE minidb_core)
   add_test(NAME minidb_index COMMAND minidb_index_tests)
 
+  add_executable(minidb_spj_tests tests/test_spj.cpp)
+  target_link_libraries(minidb_spj_tests PRIVATE minidb_core)
+  add_test(NAME minidb_spj COMMAND minidb_spj_tests)
+
   # Manual check against real data (not a ctest: needs the TPC-H .tbl files).
   add_executable(minidb_verify_index_tpch tests/verify_index_tpch.cpp)
   target_link_libraries(minidb_verify_index_tpch PRIVATE minidb_core)
+
+  add_executable(minidb_verify_spj_tpch tests/verify_spj_tpch.cpp)
+  target_link_libraries(minidb_verify_spj_tpch PRIVATE minidb_core)
+  target_compile_definitions(minidb_verify_spj_tpch PRIVATE MINIDB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 
   add_executable(minidb_verify_tpch tests/verify_tpch.cpp)
   target_link_libraries(minidb_verify_tpch PRIVATE minidb_core)

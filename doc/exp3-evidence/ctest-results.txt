@@ -1,0 +1,13 @@
+2026-11-25 | Release
+    Start 1: minidb_integration
+1/4 Test #1: minidb_integration ...............   Passed    0.74 sec
+    Start 2: minidb_storage
+2/4 Test #2: minidb_storage ...................   Passed    0.16 sec
+    Start 3: minidb_index
+3/4 Test #3: minidb_index .....................   Passed    5.70 sec
+    Start 4: minidb_spj
+4/4 Test #4: minidb_spj .......................   Passed    0.43 sec
+
+100% tests passed out of 4
+
+Total Test time (real) =   7.03 sec
